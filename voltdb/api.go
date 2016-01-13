@@ -2,7 +2,9 @@ package voltdb
 
 import (
 	"bytes"
+	"sync"
 	"fmt"
+	"log"
 	"net"
 )
 
@@ -10,6 +12,7 @@ import (
 type Conn struct {
 	tcpConn  *net.TCPConn
 	connData *connectionData
+	channels map[int64]chan *bytes.Buffer
 }
 
 // connectionData are the values returned by a successful login.
@@ -18,6 +21,8 @@ type connectionData struct {
 	connId      int64
 	leaderAddr  int32
 	buildString string
+	connCount 	int64
+	mu 		 	sync.Mutex
 }
 
 // NewConn creates an initialized, authenticated Conn.
@@ -74,33 +79,60 @@ func (conn *Conn) TestConnection() bool {
 	}
 	rsp, err := conn.Call("@Ping")
 	if err != nil {
+		fmt.Println(err)
 		return false
 	}
 	return rsp.Status() == SUCCESS
+}
+
+func (conn *Conn) Query(procedure string, params ...interface{}) (*Query, error) {
+	var call bytes.Buffer
+	var err error
+
+	if conn.tcpConn == nil {
+		return nil, fmt.Errorf("Can not call procedure on closed Conn.")
+	}
+	// Use 0 for handle; it's not necessary in pure sync client.
+	conn.connData.mu.Lock()
+	defer conn.connData.mu.Unlock()
+	conn.connData.connCount++
+	if call, err = serializeCall(procedure, conn.connData.connCount, params); err != nil {
+		return nil, err
+	}
+	if err := conn.writeMessage(call); err != nil {
+		return nil, err
+	}
+	size, err := conn.readMessageHdr()
+	if err != nil {
+		return nil, err
+	}
+	resp, err := conn.deserializeResponseMetadata()
+	return &Query{
+		size,
+		resp,
+		conn.tcpConn,
+	}, nil
 }
 
 // Call invokes the procedure 'procedure' with parameter values 'params'
 // and returns a pointer to the received Response.
 func (conn *Conn) Call(procedure string, params ...interface{}) (*Response, error) {
 	var call bytes.Buffer
-	var resp *bytes.Buffer
 	var err error
 
 	if conn.tcpConn == nil {
 		return nil, fmt.Errorf("Can not call procedure on closed Conn.")
 	}
-
-	// Use 0 for handle; it's not necessary in pure sync client.
-	if call, err = serializeCall(procedure, 0, params); err != nil {
+	if call, err = serializeCall(procedure, conn.connData.connCount, params); err != nil {
 		return nil, err
 	}
 	if err := conn.writeMessage(call); err != nil {
 		return nil, err
 	}
-	if resp, err = conn.readMessage(); err != nil {
+	if _, err = conn.readMessageHdr(); err != nil {
 		return nil, err
 	}
-	return deserializeCallResponse(resp)
+	return conn.deserializeCallResponse()
 }
 
 // Response is a stored procedure result.
@@ -116,6 +148,58 @@ type Response struct {
 	exceptionBytes  []byte
 	resultCount     int16
 	tables          []Table
+}
+
+type Query struct {
+	size 	int32
+	resp 	*Response
+	reader  *net.TCPConn
+}
+
+type Iterator struct {
+	query 	*Query
+	m 		sync.Mutex
+	err 	error
+	tables 	int16
+	table 	Table
+}
+
+func (q *Query) Iter() *Iterator {
+	t, err := deserializeTable(q.reader)
+	if  err != nil {
+		log.Println(err)
+		return nil
+	}
+	return &Iterator{
+		query: 	q,
+		err: 	nil,
+		tables: q.resp.resultCount,
+		table: 	t,
+	}
+}
+
+func (iter *Iterator) Next(row interface{}) bool {
+	iter.m.Lock()
+	defer iter.m.Unlock()
+	if iter.table.rowCount == 0 {
+		iter.tables--
+		if iter.tables == 0 {
+			iter.query.reader.Close()
+			return false
+		}
+		var err error
+		if iter.table, err = deserializeTable(iter.query.reader); err != nil {
+			log.Println(err)
+			return false
+		}
+	}
+	n, err := iter.table.next(row, iter.query.reader)	
+	if err != nil {
+		log.Println(err)
+	}
+	iter.table.rowCount--
+	iter.table.byteCount = iter.table.byteCount - n
+	return true
 }
 
 // Response status codes
@@ -189,6 +273,7 @@ type Table struct {
 	columnNames []string
 	rowCount    int32
 	rows        bytes.Buffer
+	byteCount 	int64
 }
 
 func (table *Table) GoString() string {
@@ -224,7 +309,8 @@ func (table *Table) RowCount() int {
 
 // Next populates v (*struct) with the values of the next row.
 func (table *Table) Next(v interface{}) error {
-	return table.next(v)
+	_, err := table.next(v, &table.rows)
+	return err
 }
 
 // HasNext returns true of there are additional rows to read.

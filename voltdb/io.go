@@ -14,7 +14,7 @@ import (
 // io.go includes protocol-level de/serialization code. For
 // example, serialize and write a procedure call to the network.
 
-// writeMessage prepends a header and writes header and buf to tcpConn
+// writeMessage prepends a header and writes header and buf to conn
 // Table represents a VoltDB table, often as a procedure result set.
 // Wrap up some metdata with pointer(s) to row data. Tables are
 // relatively cheap to copy (the associated user data is copied
@@ -23,10 +23,16 @@ func (conn *Conn) writeMessage(buf bytes.Buffer) error {
 	// length includes protocol version.
 	length := buf.Len() + 1
 	var netmsg bytes.Buffer
-	writeInt(&netmsg, int32(length))
-	writeProtoVersion(&netmsg)
+	err := writeInt(&netmsg, int32(length))
+	if err != nil {
+		return err
+	}
+	err = writeProtoVersion(&netmsg)
+	if err != nil {
+		return err
+	}
 	// 1 copy + 1 n/w write benchmarks faster than 2 n/w writes.
-	io.Copy(&netmsg, &buf)
+	io.Copy(&netmsg, &buf)	
 	io.Copy(conn.tcpConn, &netmsg)
 	// TODO: obviously wrong
 	return nil
@@ -39,7 +45,11 @@ func (conn *Conn) readMessageHdr() (size int32, err error) {
 	if err != nil {
 		return
 	}
-	return (size), nil
+	// strip protocol byte
+	if _, err := readByte(conn.tcpConn); err != nil {
+		return size, err
+	}
+	return size, nil
 }
 
 // readLoginResponse parses the login response message.
@@ -48,18 +58,13 @@ func (conn *Conn) readMessage() (*bytes.Buffer, error) {
 	if err != nil {
 		return nil, err
 	}
-	data := make([]byte, size)
+
+	data := make([]byte, size-1)
 	if _, err = io.ReadFull(conn.tcpConn, data); err != nil {
 		return nil, err
 	}
+
 	buf := bytes.NewBuffer(data)
-
-	// Version Byte 1
-	// TODO: error on incorrect version.
-	if _, err = readByte(buf); err != nil {
-		return nil, err
-	}
-
 	return buf, nil
 }
 
@@ -227,60 +232,70 @@ func marshalParam(buf io.Writer, param interface{}) (err error) {
 	return
 }
 
-// readCallResponse reads a stored procedure invocation response.
-func deserializeCallResponse(r io.Reader) (response *Response, err error) {
+func (conn *Conn) deserializeResponseMetadata() (response *Response, err error) {
 	response = new(Response)
-	if response.clientData, err = readLong(r); err != nil {
+	// client data
+	if response.clientData, err = readLong(conn.tcpConn); err != nil {
 		return nil, err
 	}
 
-	fields, err := readByte(r)
+	// Fields Present
+	fields, err := readByte(conn.tcpConn)
 	if err != nil {
 		return nil, err
 	} else {
 		response.fieldsPresent = uint8(fields)
 	}
 
-	if response.status, err = readByte(r); err != nil {
+	// Status
+	if response.status, err = readByte(conn.tcpConn); err != nil {
 		return nil, err
 	}
 	if response.fieldsPresent&(1<<5) != 0 {
-		if response.statusString, err = readString(r); err != nil {
+		if response.statusString, err = readString(conn.tcpConn); err != nil {
 			return nil, err
 		}
 	}
-	if response.appStatus, err = readByte(r); err != nil {
+	if response.appStatus, err = readByte(conn.tcpConn); err != nil {
 		return nil, err
 	}
 	if response.fieldsPresent&(1<<7) != 0 {
-		if response.appStatusString, err = readString(r); err != nil {
+		if response.appStatusString, err = readString(conn.tcpConn); err != nil {
 			return nil, err
 		}
 	}
-	if response.clusterLatency, err = readInt(r); err != nil {
+	if response.clusterLatency, err = readInt(conn.tcpConn); err != nil {
 		return nil, err
 	}
 	if response.fieldsPresent&(1<<6) != 0 {
-		if response.exceptionLength, err = readInt(r); err != nil {
+		if response.exceptionLength, err = readInt(conn.tcpConn); err != nil {
 			return nil, err
 		}
 		if response.exceptionLength > 0 {
 			// TODO: implement exception deserialization.
 			ignored := make([]byte, response.exceptionLength)
-			if _, err = io.ReadFull(r, ignored); err != nil {
+			if _, err = io.ReadFull(conn.tcpConn, ignored); err != nil {
 				return nil, err
 			}
 		}
 	}
-	if response.resultCount, err = readShort(r); err != nil {
+	if response.resultCount, err = readShort(conn.tcpConn); err != nil {
 		return nil, err
 	}
+	return response, nil
+}
 
+// readCallResponse reads a stored procedure invocation response.
+func (conn *Conn) deserializeCallResponse() (response *Response, err error) {
+	if response, err = conn.deserializeResponseMetadata(); err != nil {
+		return
+	}
 	response.tables = make([]Table, response.resultCount)
 	for idx, _ := range response.tables {
-		if response.tables[idx], err = deserializeTable(r); err != nil {
+		if response.tables[idx], err = deserializeTable(conn.tcpConn); err != nil {
 			return nil, err
 		}
+		response.tables[idx].read(conn.tcpConn)
 	}
 	return response, nil
 }
@@ -331,19 +346,15 @@ func deserializeTable(r io.Reader) (t Table, err error) {
 	if err != nil {
 		return errTable, err
 	}
+	t.byteCount = int64(ttlLength - metaLength - 8)
+	return t, nil
+}
 
+func (t *Table) read(r io.Reader) {
 	// the total row data byte count is:
 	//    ttlLength
 	//  - 4 byte metaLength field
 	//  - metaLength
 	//  - 4 byte row count field
-	var tableByteCount int64 = int64(ttlLength - metaLength - 8)
-
-	// OPTIMIZE? Could avoid a possibly large copy here by
-	// initializing buf to r[Pos():tableByteCount]. Unsure
-	// if that way lies madness or cleverness. For now, suck
-	// up the copy. Maybe in the future change this method
-	// to take a buffer instead of a reader?
-	io.CopyN(&t.rows, r, tableByteCount)
-	return t, nil
+	io.CopyN(&t.rows, r, t.byteCount)
 }

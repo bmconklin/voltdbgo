@@ -29,12 +29,11 @@ const (
 var order = binary.BigEndian
 
 // protoVersion is the implemented VoltDB wireprotocol version.
-const protoVersion = 1
+const protoVersion = 0
 
 func writeProtoVersion(w io.Writer) error {
-	var b [1]byte
-	b[0] = protoVersion
-	_, err := w.Write(b[:1])
+	b := []byte{protoVersion}
+	_, err := w.Write(b)
 	return err
 }
 
@@ -195,7 +194,7 @@ func readString(r io.Reader) (result string, err error) {
 	if err != nil {
 		return
 	}
-	if length == -1 {
+	if length < 1 {
 		// NULL string not supported, return zero value
 		return
 	}

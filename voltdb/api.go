@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"io"
 )
 
 // Conn is a single connection to a single node of a VoltDB database
@@ -159,9 +160,11 @@ type Query struct {
 type Iterator struct {
 	query 	*Query
 	m 		sync.Mutex
-	err 	error
+	Err 	error
 	tables 	int16
 	table 	Table
+	buffer 	chan *bytes.Buffer
+	bufSize int
 }
 
 func (q *Query) Iter() *Iterator {
@@ -170,35 +173,67 @@ func (q *Query) Iter() *Iterator {
 		log.Println(err)
 		return nil
 	}
-	return &Iterator{
+	it := &Iterator{
 		query: 	q,
-		err: 	nil,
+		Err: 	nil,
 		tables: q.resp.resultCount,
 		table: 	t,
+		bufSize:10,
+	}
+	it.buffer = make(chan *bytes.Buffer, it.bufSize)
+	go it.fillBuffer()
+	return it
+}
+
+func (iter *Iterator) fillBuffer() {
+	for {
+		if iter.table.rowCount == 0 {
+			iter.tables--
+			if iter.tables == 0 {
+				iter.query.reader.Close()
+				close(iter.buffer)
+				return
+			}
+			var err error
+			if iter.table, err = deserializeTable(iter.query.reader); err != nil {
+				iter.Err = err
+				continue
+			}
+		}
+
+		// each row has a 4 byte length
+		n, err := readInt(iter.query.reader)
+		if err != nil {
+			iter.Err = err
+		} else if n <= 0 {
+			iter.Err = fmt.Errorf("No more row data.")
+			continue
+		}
+		iter.table.rowCount--
+		iter.table.byteCount = iter.table.byteCount - int64(n)
+
+		data := make([]byte, n)
+		length, err := io.ReadAtLeast(iter.query.reader, data, int(n))
+		if int32(length) != n {
+			fmt.Println("WTF!?")
+			fmt.Println("Got", length, "Expected", n)
+		}
+		if err != nil {
+			iter.Err = err
+		}
+		iter.buffer <- bytes.NewBuffer(data)
 	}
 }
 
 func (iter *Iterator) Next(row interface{}) bool {
-	iter.m.Lock()
-	defer iter.m.Unlock()
-	if iter.table.rowCount == 0 {
-		iter.tables--
-		if iter.tables == 0 {
-			iter.query.reader.Close()
-			return false
-		}
-		var err error
-		if iter.table, err = deserializeTable(iter.query.reader); err != nil {
-			log.Println(err)
-			return false
-		}
+	buf, ok := <- iter.buffer
+	if !ok {
+		return false
 	}
-	n, err := iter.table.next(row, iter.query.reader)	
+	err := iter.table.next(row, buf)	
 	if err != nil {
-		log.Println(err)
+		iter.Err = err
 	}
-	iter.table.rowCount--
-	iter.table.byteCount = iter.table.byteCount - n
 	return true
 }
 
@@ -309,8 +344,15 @@ func (table *Table) RowCount() int {
 
 // Next populates v (*struct) with the values of the next row.
 func (table *Table) Next(v interface{}) error {
-	_, err := table.next(v, &table.rows)
-	return err
+	// each row has a 4 byte length
+	n, err := readInt(&table.rows)
+	if err != nil {
+		return err
+	} else if n <= 0 {
+		return fmt.Errorf("No more row data.")
+
+	}
+	return table.next(v, &table.rows)
 }
 
 // HasNext returns true of there are additional rows to read.

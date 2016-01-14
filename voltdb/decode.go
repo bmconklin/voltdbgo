@@ -9,29 +9,23 @@ import (
 // Internal methods to unmarshal / reflect a returned table []byte
 // into a slice of user provided row structs.
 
-func (table *Table) next(v interface{}, r io.Reader) (int64, error) {
+func (table *Table) next(v interface{}, r io.Reader) error {
 	// iterate and assign the fields from data
 	// must have a pointer to be modifiable
 	rv := reflect.ValueOf(v)
 	if rv.Kind() != reflect.Ptr || rv.IsNil() {
-		return int64(0), fmt.Errorf("Must supply a struct pointer")
+		return fmt.Errorf("Must supply a struct pointer")
 	}
 
 	// must have a struct
 	structVal := rv.Elem()
 	typeOfT := structVal.Type()
 	if typeOfT.Kind() != reflect.Struct {
-		return int64(0), fmt.Errorf("Must supply a struct to populate with row data.")
+		return fmt.Errorf("Must supply a struct to populate with row data.")
 	}
 
 	if structVal.NumField() != int(table.columnCount) {
-		return int64(0), fmt.Errorf("Must supply one field per column.")
-	}
-
-	// each row has a 4 byte length
-	rowLength, err := readInt(r)
-	if err != nil || rowLength <= 0 {
-		return int64(0), err
+		return fmt.Errorf("Must supply one field per column.")
 	}
 
 	for idx, vt := range table.columnTypes {
@@ -69,5 +63,5 @@ func (table *Table) next(v interface{}, r io.Reader) (int64, error) {
 		}
 	}
 
-	return int64(rowLength), nil
+	return nil
 }

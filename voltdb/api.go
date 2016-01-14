@@ -13,7 +13,6 @@ import (
 type Conn struct {
 	tcpConn  *net.TCPConn
 	connData *connectionData
-	channels map[int64]chan *bytes.Buffer
 }
 
 // connectionData are the values returned by a successful login.
@@ -80,7 +79,6 @@ func (conn *Conn) TestConnection() bool {
 	}
 	rsp, err := conn.Call("@Ping")
 	if err != nil {
-		fmt.Println(err)
 		return false
 	}
 	return rsp.Status() == SUCCESS

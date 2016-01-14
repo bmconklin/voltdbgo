@@ -1,6 +1,7 @@
 package voltdb
 
 import (
+	"reflect"
 	"bytes"
 	"sync"
 	"fmt"
@@ -21,8 +22,8 @@ type connectionData struct {
 	connId      int64
 	leaderAddr  int32
 	buildString string
-	connCount 	int64
-	mu 		 	sync.Mutex
+	connCount   int64
+	mu 	        sync.Mutex
 }
 
 // NewConn creates an initialized, authenticated Conn.
@@ -165,18 +166,18 @@ type Iterator struct {
 	bufSize int
 }
 
-func (q *Query) Iter() *Iterator {
+func (q *Query) Iter(n int) *Iterator {
 	t, err := deserializeTable(q.reader)
 	if  err != nil {
 		log.Println(err)
 		return nil
 	}
 	it := &Iterator{
-		query: 	q,
-		Err: 	nil,
-		tables: q.resp.resultCount,
-		table: 	t,
-		bufSize:10,
+		query: 		q,
+		Err: 		nil,
+		tables: 	q.resp.resultCount,
+		table: 		t,
+		bufSize:	n,
 	}
 	it.buffer = make(chan *bytes.Buffer, it.bufSize)
 	go it.fillBuffer()
@@ -221,6 +222,34 @@ func (iter *Iterator) fillBuffer() {
 		}
 		iter.buffer <- bytes.NewBuffer(data)
 	}
+}
+
+func (iter *Iterator) All(result interface{}) error {
+	resultv := reflect.ValueOf(result)
+	if resultv.Kind() != reflect.Ptr || resultv.Elem().Kind() != reflect.Slice {
+		panic("result argument must be a slice address")
+	}
+	slicev := resultv.Elem()
+	slicev = slicev.Slice(0, slicev.Cap())
+	elemt := slicev.Type().Elem()
+	i := 0
+	for {
+		if slicev.Len() == i {
+			elemp := reflect.New(elemt)
+			if !iter.Next(elemp.Interface()) {
+				break
+			}
+			slicev = reflect.Append(slicev, elemp.Elem())
+			slicev = slicev.Slice(0, slicev.Cap())
+		} else {
+			if !iter.Next(slicev.Index(i).Addr().Interface()) {
+				break
+			}
+		}
+		i++
+	}
+	resultv.Elem().Set(slicev.Slice(0, i))
+	return nil
 }
 
 func (iter *Iterator) Next(row interface{}) bool {
@@ -348,7 +377,6 @@ func (table *Table) Next(v interface{}) error {
 		return err
 	} else if n <= 0 {
 		return fmt.Errorf("No more row data.")
-
 	}
 	return table.next(v, &table.rows)
 }

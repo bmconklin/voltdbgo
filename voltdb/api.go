@@ -85,6 +85,8 @@ func (conn *Conn) TestConnection() bool {
 	return rsp.Status() == SUCCESS
 }
 
+// Like Call, but return a Call header response rather than a full response.
+// Keeps connection open to read the rest at your leisure.
 func (conn *Conn) Query(procedure string, params ...interface{}) (*Query, error) {
 	var call bytes.Buffer
 	var err error
@@ -150,12 +152,15 @@ type Response struct {
 	tables          []Table
 }
 
+// Query wraps Response and keeps the connection reader 
+// open to read at your own pace.
 type Query struct {
 	size 	int32
 	resp 	*Response
 	reader  *net.TCPConn
 }
 
+// Iterator iterates over each row in a Query response.
 type Iterator struct {
 	query 	*Query
 	m 		sync.Mutex
@@ -166,7 +171,10 @@ type Iterator struct {
 	bufSize int
 }
 
-func (q *Query) Iter(n int) *Iterator {
+// Create an Iterator with a set bufferSize. The iterator will read 
+// bufferSize rows from the TCP connection and then wait before reading
+// any more until the buffer is drained.
+func (q *Query) Iter(bufferSize int) *Iterator {
 	t, err := deserializeTable(q.reader)
 	if  err != nil {
 		log.Println(err)
@@ -177,13 +185,14 @@ func (q *Query) Iter(n int) *Iterator {
 		Err: 		nil,
 		tables: 	q.resp.resultCount,
 		table: 		t,
-		bufSize:	n,
+		bufferSize:	bufferSize,
 	}
 	it.buffer = make(chan *bytes.Buffer, it.bufSize)
 	go it.fillBuffer()
 	return it
 }
 
+// read up to Iterator.bufferSize items.
 func (iter *Iterator) fillBuffer() {
 	for {
 		if iter.table.rowCount == 0 {
@@ -224,6 +233,10 @@ func (iter *Iterator) fillBuffer() {
 	}
 }
 
+// Read all items from an Iterator until the query response ends. 
+// Expects a *[]struct{} as a parameter. Will panic if interface{} passed
+// in is not a slice.
+// Automatically closes the iterator once the end of the Query response is reached.
 func (iter *Iterator) All(result interface{}) error {
 	resultv := reflect.ValueOf(result)
 	if resultv.Kind() != reflect.Ptr || resultv.Elem().Kind() != reflect.Slice {
@@ -252,6 +265,10 @@ func (iter *Iterator) All(result interface{}) error {
 	return nil
 }
 
+// Read an individual row from an iterator and store it in the struct passed in.
+// Will return true for as long as there is a next value available in the iterator
+// so that it can be called using 'for iterator.Next(&struct{}) {}'.
+// Automatically closes the iterator once the end of the Query response is reached.
 func (iter *Iterator) Next(row interface{}) bool {
 	buf, ok := <- iter.buffer
 	if !ok {

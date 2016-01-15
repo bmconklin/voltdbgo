@@ -7,7 +7,7 @@ import (
 )
 
 // Internal methods to unmarshal / reflect a returned table []byte
-// into a slice of user provided row structs.
+// into a slice of user provided row structs from the reader passed in.
 
 func (table *Table) next(v interface{}, r io.Reader) error {
 	// iterate and assign the fields from data

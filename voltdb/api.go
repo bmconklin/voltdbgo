@@ -162,13 +162,13 @@ type Query struct {
 
 // Iterator iterates over each row in a Query response.
 type Iterator struct {
-	query 	*Query
-	m 		sync.Mutex
-	Err 	error
-	tables 	int16
-	table 	Table
-	buffer 	chan *bytes.Buffer
-	bufSize int
+	query 		*Query
+	m 			sync.Mutex
+	Err 		error
+	tables 		int16
+	table 		Table
+	buffer 		chan *bytes.Buffer
+	bufferSize 	int
 }
 
 // Create an Iterator with a set bufferSize. The iterator will read 
@@ -187,7 +187,7 @@ func (q *Query) Iter(bufferSize int) *Iterator {
 		table: 		t,
 		bufferSize:	bufferSize,
 	}
-	it.buffer = make(chan *bytes.Buffer, it.bufSize)
+	it.buffer = make(chan *bytes.Buffer, it.bufferSize)
 	go it.fillBuffer()
 	return it
 }
